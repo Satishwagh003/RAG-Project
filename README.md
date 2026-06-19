@@ -253,17 +253,4 @@ Answers and follow-up questions are presented to the user.
 
 ---
 
-## 📸 Application Screenshots
-
-Add screenshots here
-
-### 🏠 Home Page
-
-<img width="100%" alt="Home Page" src="images/home.png">
-
-### 💬 Chat Interface
-
-<img width="100%" alt="Chat Interface" src="images/chat.png">
-
----
 
