@@ -1,153 +1,335 @@
 import streamlit as st
+import uuid
 import os
+from pathlib import Path
+from typing import List, Tuple
+from dotenv import load_dotenv
+from pypdf import PdfReader
 import pandas as pd
-from PyPDF2 import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+import math
+from pydantic import SecretStr
+
+from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
+
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
-from dotenv import load_dotenv
-from langchain_openai import AzureChatOpenAI
-from docx import Document
 
-# Load environment variables
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from langchain_openai import AzureChatOpenAI
+
+# New import path for summarize chain (LangChain >= 0.2)
+try:
+    from langchain.chains.summarize import load_summarize_chain  # type: ignore
+except Exception:
+    # Summarize chain isn't available in this environment; fall back to excerpt-based summary
+    load_summarize_chain = None
+
+
+# ==========================
+# Load ENV variables
+# ==========================
+
 load_dotenv()
 
-# Fetch values from .env file
-AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
-api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
-deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-35-turbo")
+AZURE_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+AZURE_MODEL = os.getenv("AZURE_OPENAI_MODEL")
+AZURE_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 
 FAISS_INDEX_PATH = "faiss_index"
 
-# Function to extract text from PDFs
-def get_pdf_text(pdf_docs):
-    text = ""
-    for pdf in pdf_docs:
-        pdf_reader = PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text() or ""
-    return text
 
-# Function to extract text from Excel files
-def get_excel_text(excel_docs):
-    chunks = []
-    for excel in excel_docs:
-        df = pd.read_excel(excel, sheet_name=None, dtype=str)
-        for sheet in df.values():
-            for _, row in sheet.iterrows():
-                row_values = row.dropna().astype(str)
-                row_text = " | ".join(row_values.tolist())
-                chunks.append(row_text)
-    return chunks
+# ==========================
+# Validate ENV
+# ==========================
 
-# Function to extract text from TXT and DOCX files
-def get_text_from_file(file):
-    if file.name.endswith(".txt"):
-        return file.read().decode("utf-8")
-    elif file.name.endswith(".docx"):
-        doc = Document(file)
-        return "\n".join([para.text for para in doc.paragraphs])
-    return ""
+def validate_env_vars():
+    required = {
+        "AZURE_OPENAI_API_KEY": AZURE_API_KEY,
+        "AZURE_OPENAI_ENDPOINT": AZURE_ENDPOINT,
+        "AZURE_OPENAI_DEPLOYMENT_NAME": AZURE_DEPLOYMENT,
+        "AZURE_OPENAI_MODEL": AZURE_MODEL,
+        "AZURE_OPENAI_API_VERSION": AZURE_API_VERSION
+    }
 
-# Function to split text into chunks
-def get_text_chunks(text_chunks):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
-    return text_splitter.split_text("\n".join(text_chunks))
+    missing = [k for k, v in required.items() if not v]
 
-# Function to create FAISS vector store
-def get_vector_store(text_chunks):
-    embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
-    vector_store.save_local(FAISS_INDEX_PATH)
-    st.success("✅ FAISS index created successfully! You can now ask questions.")
+    if missing:
+        raise ValueError(
+            "❌ Missing environment variables:\n"
+            + "\n".join(missing)
+            + "\n\nAdd them in your .env file."
+        )
 
-# Function to load conversational chain
-def get_conversational_chain():
-    prompt_template = """
-    You are an AI assistant tasked with answering questions based only on the provided context.
-    Also give all the Follow Up Questions linked to the asked question from the provided context.
-    Use the provided context to answer the question with the highest possible accuracy.
-    Do not use external knowledge—only rely on the given context.
 
-    Context:\n {context}?\n
-    Question: \n{question}\n
-    Answer:
-    """
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-    llm = AzureChatOpenAI(
-        azure_endpoint=AZURE_OPENAI_ENDPOINT,
-        api_version=api_version,
-        deployment_name = deployment_name,
-        api_key=AZURE_OPENAI_API_KEY
+# ==========================
+# PDF Reader
+# ==========================
+
+def get_pdf_text(pdf_doc) -> str:
+    try:
+        text = ""
+        reader = PdfReader(pdf_doc)
+
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + "\n"
+
+        return text.strip()
+
+    except Exception as e:
+        st.error(f"Error reading {pdf_doc.name}: {e}")
+        return ""
+
+
+def create_docs(pdf_files, unique_id: str) -> List[Document]:
+    docs = []
+
+    for f in pdf_files:
+        text = get_pdf_text(f)
+
+        if not text:
+            st.warning(f"⚠️ Could not extract text from {f.name}")
+            continue
+
+        docs.append(
+            Document(
+                page_content=text,
+                metadata={
+                    "name": f.name,
+                    "size": getattr(f, "size", None),
+                    "unique_id": unique_id
+                }
+            )
+        )
+
+    return docs
+
+
+# ==========================
+# Embeddings
+# ==========================
+
+@st.cache_resource
+def create_embeddings():
+    return SentenceTransformerEmbeddings(
+        model_name="all-MiniLM-L6-v2"
     )
-    return load_qa_chain(llm, prompt=prompt)
 
-# Streamlit App
+
+# ==========================
+# FAISS Index
+# ==========================
+
+def save_faiss_index(docs, embeddings):
+    Path(FAISS_INDEX_PATH).mkdir(parents=True, exist_ok=True)
+
+    vs = FAISS.from_documents(docs, embeddings)
+    vs.save_local(FAISS_INDEX_PATH)
+
+    return vs
+
+
+def load_faiss_index(embeddings):
+    if not Path(FAISS_INDEX_PATH).exists():
+        raise FileNotFoundError("⚠️ No FAISS index found. Please upload resumes first.")
+
+    return FAISS.load_local(
+        FAISS_INDEX_PATH,
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
+
+
+def similar_docs(query: str, k: int, embeddings):
+    vs = load_faiss_index(embeddings)
+
+    results = vs.similarity_search_with_score(query, k=k)
+
+    # lower score = better match
+    return sorted(results, key=lambda x: x[1])
+
+
+# ==========================
+# Azure OpenAI LLM
+# ==========================
+
+def get_llm():
+    return AzureChatOpenAI(
+        azure_deployment=AZURE_DEPLOYMENT,
+        model=AZURE_MODEL,
+        temperature=0,
+        api_version=AZURE_API_VERSION,
+        azure_endpoint=AZURE_ENDPOINT,
+        api_key=SecretStr(AZURE_API_KEY) if AZURE_API_KEY else None
+    )
+
+
+# ==========================
+# Resume Summary
+# ==========================
+
+def get_summary(doc: Document):
+    try:
+        llm = get_llm()
+
+        if load_summarize_chain:
+            chain = load_summarize_chain(
+                llm,
+                chain_type="map_reduce"
+            )
+            out = chain.invoke([doc])
+            return out.get("output_text", "Summary not available")
+        else:
+            # Fallback: return a concise excerpt when summarize chain is unavailable
+            excerpt = doc.page_content.strip()
+            return excerpt[:2000] + ("..." if len(excerpt) > 2000 else "")
+
+    except Exception as e:
+        return f"⚠️ Error generating summary: {e}"
+
+
+# ==========================
+# Match Score
+# ==========================
+
+def calculate_match_percentage(distance: float):
+    score = 100 * math.exp(-distance / 2)
+    return max(0, min(100, score))
+
+
+# ==========================
+# Streamlit UI
+# ==========================
+
 def main():
-    st.set_page_config(page_title="QnA ChatBot FAQs from Documents", page_icon=":books:", layout="wide")
-    st.header("QnA ChatBot FAQs from Documents 💬")
 
-    # Initialize session state for chat history
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+    st.set_page_config(
+        page_title="Resume Screening Assistant",
+        page_icon="💼",
+        layout="wide"
+    )
 
-    # Sidebar: Upload and process files
-    with st.sidebar:
-        st.title("Upload & Process Files")
-        pdf_docs = st.file_uploader("Upload PDFs", type=["pdf"], accept_multiple_files=True)
-        excel_docs = st.file_uploader("Upload Excel Files", type=["xls", "xlsx"], accept_multiple_files=True)
-        txt_docs = st.file_uploader("Upload TXT/DOCX Files", type=["txt", "docx"], accept_multiple_files=True)
+    st.title("💼 HR Resume Screening Assistant")
+    st.caption("Find best matching resumes for a job description")
 
-        if st.button("Process Documents"):
-            raw_text = []
+    try:
+        validate_env_vars()
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
 
-            if pdf_docs:
-                raw_text.append(get_pdf_text(pdf_docs))
+    if "unique_id" not in st.session_state:
+        st.session_state.unique_id = ""
 
-            if excel_docs:
-                raw_text.extend(get_excel_text(excel_docs))
+    col1, col2 = st.columns([3, 1])
 
-            if txt_docs:
-                for doc in txt_docs:
-                    raw_text.append(get_text_from_file(doc))
+    with col1:
+        job_description = st.text_area(
+            "Paste Job Description",
+            height=200
+        )
 
-            if raw_text:
-                text_chunks = get_text_chunks(raw_text)
-                get_vector_store(text_chunks)
+    with col2:
+        document_count = st.number_input(
+            "Resumes to return",
+            min_value=1,
+            max_value=20,
+            value=5
+        )
 
-    # Option to clear chat
-    if st.button("Clear Chat History"):
-        st.session_state.chat_history = []
-        st.rerun()
+    pdf_files = st.file_uploader(
+        "Upload Resumes (PDF only)",
+        type=["pdf"],
+        accept_multiple_files=True
+    )
 
-    # Ask question
-    st.subheader("Ask a Question")
-    user_question = st.text_input("Enter your question here 👇")
+    if st.button("🔍 Analyze Resumes", type="primary"):
 
-    if user_question:
-        if not os.path.exists(os.path.join(FAISS_INDEX_PATH, "index.faiss")):
-            st.error("❌ FAISS index not found. Please upload and process documents first.")
-            #return
+        if not job_description.strip():
+            st.warning("Please enter a job description")
+            return
 
-        embeddings = SentenceTransformerEmbeddings(model_name="all-MiniLM-L6-v2")
-        vector_store = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
-        chain = get_conversational_chain()
+        if not pdf_files:
+            st.warning("Please upload resumes")
+            return
 
-        docs = vector_store.similarity_search(user_question, k=3)
-        response = chain({"input_documents": docs, "question": user_question}, return_only_outputs=True)["output_text"]
+        with st.spinner("Processing resumes..."):
 
-        # Add to chat history
-        st.session_state.chat_history.append((user_question, response))
+            st.session_state.unique_id = uuid.uuid4().hex
 
-    # Display chat history
-    if st.session_state.chat_history:
-        st.markdown("### 💬 Chat History")
-        for i, (q, a) in enumerate(st.session_state.chat_history):
-            st.markdown(f"**🧑 You:** {q}")
-            st.markdown(f"**🤖 AI:** {a}")
+            docs = create_docs(pdf_files, st.session_state.unique_id)
+
+            if not docs:
+                st.error("No text extracted from resumes")
+                return
+
+            embeddings = create_embeddings()
+
+            save_faiss_index(docs, embeddings)
+
+            k = min(int(document_count), len(docs))
+
+            relevant_docs = similar_docs(job_description, k, embeddings)
+
+        st.divider()
+        st.subheader("📊 Best Matching Resumes")
+
+        for idx, (doc, distance) in enumerate(relevant_docs):
+
+            score = calculate_match_percentage(distance)
+
+            if score >= 80:
+                badge = "🟢 Excellent Match"
+            elif score >= 60:
+                badge = "🟡 Good Match"
+            elif score >= 40:
+                badge = "🟠 Fair Match"
+            else:
+                badge = "🔴 Weak Match"
+
+            with st.container():
+
+                c1, c2, c3 = st.columns([2, 1, 1])
+
+                with c1:
+                    st.markdown(f"### {idx+1}. {doc.metadata.get('name','Resume')}")
+
+                with c2:
+                    st.metric("Match Score", f"{score:.1f}%")
+
+                with c3:
+                    st.write(badge)
+
+                with st.expander("📄 View Summary"):
+
+                    st.markdown("**Summary:**")
+
+                    with st.spinner("Summarizing..."):
+                        summary = get_summary(doc)
+
+                    st.write(summary)
+
+                    st.json({
+                        "File Name": doc.metadata.get("name"),
+                        "Distance Score": f"{distance:.4f}",
+                        "Match %": f"{score:.2f}%"
+                    })
+
+                    if st.checkbox(f"Show Full Text", key=f"t{idx}"):
+                        st.text_area(
+                            "Resume Content",
+                            doc.page_content[:2000] +
+                            ("..." if len(doc.page_content) > 2000 else ""),
+                            height=300
+                        )
+
+        st.success("✅ Resume analysis completed")
+
 
 if __name__ == "__main__":
     main()
